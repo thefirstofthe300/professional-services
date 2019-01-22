@@ -15,19 +15,26 @@
 package main
 
 import (
-	"sync"
-	"time"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
+	"sync"
+	"time"
 
-	"github.com/GoogleCloudPlatform/professional-services/tools/resource-janitor/pkg/utils"
 	"github.com/GoogleCloudPlatform/professional-services/tools/resource-janitor/pkg/delete"
+	"github.com/GoogleCloudPlatform/professional-services/tools/resource-janitor/pkg/utils"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
+	yaml "gopkg.in/yaml.v2"
 )
+
+type BlacklistConfig struct {
+	Instances []string `yaml:"instances"`
+	Images    []string `yaml:"images"`
+}
 
 func main() {
 	project := flag.String("project", "foo", "ID of the project to clean up")
@@ -35,6 +42,8 @@ func main() {
 	workers := flag.Int("workers", 10, "Delimiter used to separate parts of the resource name")
 	olderThan := flag.Int64("older-than", 2592000, "Time in seconds that resources should not be older than")
 	logFile := flag.String("log-file", "", "File to which output is sent. Default is STDOUT.")
+	blacklistFile := flag.String("blacklist-file", "", "YAML config file with a list of naming schemes to ignore")
+	deleteSingletons := flag.Bool("delete-singletons", false, "If set, all resources that are older than the time specified will be deleted regardless of whether they are the only resource of a certain name.")
 	notDryRun := flag.Bool("not-dry-run", false, "Logs the changes that will be made without taking any actions.")
 
 	flag.Parse()
@@ -48,6 +57,22 @@ func main() {
 		log.SetOutput(file)
 	}
 
+	blacklistConfig := BlacklistConfig{
+		Instances: []string{},
+		Images:    []string{},
+	}
+	if *blacklistFile != "" {
+		blacklist, err := ioutil.ReadFile(*blacklistFile)
+		if err != nil {
+			fmt.Printf("main.go: unable to open blacklist file: %s", err)
+		}
+
+		err = yaml.Unmarshal(blacklist, &blacklistConfig)
+		if err != nil {
+			fmt.Printf("main.go: unable to parse blacklist file: %s", err)
+		}
+	}
+
 	compute, err := initClient()
 	if err != nil {
 		log.Fatalf("main.go: unable to initialize Compute Engine client: %s", err)
@@ -57,8 +82,8 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go deleteImages(compute, *project, tooOld, *nameDelimiter, *workers, *notDryRun, &wg)
-	go deleteInstances(compute, *project, tooOld, *nameDelimiter, *workers, *notDryRun, &wg)
+	go deleteImages(compute, *project, tooOld, *nameDelimiter, *workers, *notDryRun, *deleteSingletons, blacklistConfig.Images, &wg)
+	go deleteInstances(compute, *project, tooOld, *nameDelimiter, *workers, *notDryRun, *deleteSingletons, blacklistConfig.Instances, &wg)
 	wg.Wait()
 }
 
@@ -77,8 +102,8 @@ func initClient() (*compute.Service, error) {
 	return computeService, nil
 }
 
-func deleteImages(computeSvc *compute.Service, project string, tooOld time.Time, nameDelimiter string, workers int, notDryRun bool, wg *sync.WaitGroup) {
-	images, err := utils.GetOldAndNonSingletonImages(computeSvc, project, tooOld, nameDelimiter)
+func deleteImages(computeSvc *compute.Service, project string, tooOld time.Time, nameDelimiter string, workers int, notDryRun bool, deleteSingletons bool, blacklist []string, wg *sync.WaitGroup) {
+	images, err := utils.GetOldAndNonSingletonImages(computeSvc, project, tooOld, deleteSingletons, blacklist, nameDelimiter)
 	if err != nil {
 		log.Fatalf("main.go: unable to get list of images older than %s: %s", tooOld, err)
 	}
@@ -101,8 +126,8 @@ func deleteImages(computeSvc *compute.Service, project string, tooOld time.Time,
 	wg.Done()
 }
 
-func deleteInstances(computeSvc *compute.Service, project string, tooOld time.Time, nameDelimiter string, workers int, notDryRun bool, wg *sync.WaitGroup) {
-	instances, err := utils.GetOldAndNonSingletonInstances(computeSvc, project, tooOld, nameDelimiter)
+func deleteInstances(computeSvc *compute.Service, project string, tooOld time.Time, nameDelimiter string, workers int, notDryRun bool, deleteSingletons bool, blacklist []string, wg *sync.WaitGroup) {
+	instances, err := utils.GetOldAndNonSingletonInstances(computeSvc, project, tooOld, deleteSingletons, blacklist, nameDelimiter)
 	if err != nil {
 		log.Fatalf("main.go: unable to get list of instances older than %s: %s", tooOld, err)
 	}
@@ -122,3 +147,4 @@ func deleteInstances(computeSvc *compute.Service, project string, tooOld time.Ti
 
 	wg.Done()
 }
+

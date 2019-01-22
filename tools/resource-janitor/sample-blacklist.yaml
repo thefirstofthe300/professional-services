@@ -1,0 +1,6 @@
+instances:
+  - ^ignore-me
+  - ^pls-ignore-me-too
+images:
+  - ^i-want-to-be-ignored
+  - ^along-with-these-wildcards*

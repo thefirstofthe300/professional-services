@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"regexp"
 	"fmt"
 	"google.golang.org/api/compute/v1"
 	"log"
@@ -11,7 +12,7 @@ import (
 // GetOldAndNonSingletonImages returns a list of images that are older
 // than the specified time and are not the only images with the same naming
 // scheme while leaving the newest image
-func GetOldAndNonSingletonImages(computeService *compute.Service, project string, t time.Time, nameDelimiter string) ([]*compute.Image, error) {
+func GetOldAndNonSingletonImages(computeService *compute.Service, project string, t time.Time, deleteSingletons bool, blacklist []string, nameDelimiter string) ([]*compute.Image, error) {
 	imageListCall := computeService.Images.List(project).OrderBy("creationTimestamp desc")
 
 	allImages := []*compute.Image{}
@@ -22,7 +23,15 @@ func GetOldAndNonSingletonImages(computeService *compute.Service, project string
 		}
 
 		for _, image := range imageList.Items {
-			allImages = append(allImages, image)
+			for _, blacklistPattern := range blacklist {
+				re := regexp.MustCompile(blacklistPattern)
+				// If not blacklisted, add to images to process
+				if !re.MatchString(image.Name) {
+					allImages = append(allImages, image)
+				} else {
+					log.Printf("utils.go: ignoring blacklisted image: %s", image.Name)
+				}
+			}
 		}
 		if imageList.NextPageToken == "" {
 			break
@@ -30,7 +39,12 @@ func GetOldAndNonSingletonImages(computeService *compute.Service, project string
 		imageListCall = imageListCall.PageToken(imageList.NextPageToken)
 	}
 
-	nonSingletonImages := getNonSingletonImages(allImages, nameDelimiter)
+	var nonSingletonImages []*compute.Image
+	if !deleteSingletons {
+		nonSingletonImages = getNonSingletonImages(allImages, nameDelimiter)
+	} else {
+		nonSingletonImages = allImages
+	}
 	oldAndNonSingletonImages, err := getOldImages(nonSingletonImages, t)
 	if err != nil {
 		return nil, fmt.Errorf("utils.go: Unable to get old images: %s", err)
@@ -82,7 +96,7 @@ func getOldImages(i []*compute.Image, t time.Time) ([]*compute.Image, error) {
 // GetOldAndNonSingletonInstances returns a list of instances that are older
 // than the specified time and are not the only instances with the same naming
 // scheme.
-func GetOldAndNonSingletonInstances(computeService *compute.Service, project string, t time.Time, nameDelimiter string) ([]*compute.Instance, error) {
+func GetOldAndNonSingletonInstances(computeService *compute.Service, project string, t time.Time, deleteSingletons bool, blacklist []string, nameDelimiter string) ([]*compute.Instance, error) {
 	zones, err := computeService.Zones.List(project).Do()
 	if err != nil {
 		log.Fatalf("utils.go: Unable to get list of zones: %s", err)
@@ -100,7 +114,15 @@ func GetOldAndNonSingletonInstances(computeService *compute.Service, project str
 			}
 
 			for _, instance := range instanceList.Items {
-				allInstances = append(allInstances, instance)
+				for _, blacklistPattern := range blacklist {
+					re := regexp.MustCompile(blacklistPattern)
+					// If not blacklisted, add to instances to process
+					if !re.MatchString(instance.Name) {
+						allInstances = append(allInstances, instance)
+					} else {
+						log.Printf("utils.go: ignoring blacklisted instance: %s", instance.Name)
+					}
+				}
 			}
 			if instanceList.NextPageToken == "" {
 				break
@@ -109,7 +131,12 @@ func GetOldAndNonSingletonInstances(computeService *compute.Service, project str
 		}
 	}
 
-	nonSingletonInstances := getNonSingletonInstances(allInstances, nameDelimiter)
+	var nonSingletonInstances []*compute.Instance
+	if !deleteSingletons {
+		nonSingletonInstances = getNonSingletonInstances(allInstances, nameDelimiter)
+	} else {
+		nonSingletonInstances = allInstances
+	}
 	oldAndNonSingletonInstances, err := getOldInstances(nonSingletonInstances, t)
 	if err != nil {
 		return nil, fmt.Errorf("utils.go: Unable to get old instances: %s", err)
