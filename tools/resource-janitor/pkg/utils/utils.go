@@ -1,18 +1,18 @@
 package utils
 
 import (
-	"strings"
-	"log"
 	"fmt"
-	"time"
 	"google.golang.org/api/compute/v1"
+	"log"
+	"strings"
+	"time"
 )
 
 // GetOldAndNonSingletonImages returns a list of images that are older
 // than the specified time and are not the only images with the same naming
-// scheme.
+// scheme while leaving the newest image
 func GetOldAndNonSingletonImages(computeService *compute.Service, project string, t time.Time, nameDelimiter string) ([]*compute.Image, error) {
-	imageListCall := computeService.Images.List(project)
+	imageListCall := computeService.Images.List(project).OrderBy("creationTimestamp desc")
 
 	allImages := []*compute.Image{}
 	for {
@@ -40,37 +40,20 @@ func GetOldAndNonSingletonImages(computeService *compute.Service, project string
 }
 
 func getNonSingletonImages(imageList []*compute.Image, nameDelimiter string) []*compute.Image {
-	singleton := &compute.Image{}
+	nonSingletonsMap := make(map[string]string)
 	nonSingletons := []*compute.Image{}
 	for i := range imageList {
-		if i == 0 {
-			singleton = imageList[i]
-			continue
-		}
-
-		// Whether or not an image is singleton is tracked using the singleton
-		// variable. If the two currently compared images match, neither can be
-		// a singleton. If the two currently compared images don't match and the
-		// singleton variable is set, the image is a singleton. Otherwise, the
-		// image that is the current `i` value in the loop is a candidate to be a
-		// singleton.
-		if resourceNamesMatch(imageList[i-1].Name, imageList[i].Name, nameDelimiter) {
-			singleton = &compute.Image{}
-			nonSingletons = append(nonSingletons, imageList[i-1])
-			if len(imageList)-1 == i {
-				log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is most recent of its type\"", imageList[i].Name, imageList[i].CreationTimestamp)
-			}
-		} else if singleton.Name != "" {
-			singleton = imageList[i]
-			log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is singleton\"", singleton.Name, singleton.CreationTimestamp)
+		if _, ok := nonSingletonsMap[getResourceName(imageList[i].Name, nameDelimiter)]; !ok {
+			nonSingletonsMap[getResourceName(imageList[i].Name, nameDelimiter)] = "yes"
+			log.Printf("utils.go: image excluded from deletion: name=%s creationTimestamp=%s reason=\"image is newest of its kind\"", imageList[i].Name, imageList[i].CreationTimestamp)
 		} else {
-			// Ignore the resource (imageList[i-1]) that was matched to a resource at some point
-			// This block is run when the most recent of a certain type is at imageList[i-1]
-			singleton = imageList[i]
-			log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is most recent of its type\"", imageList[i-1].Name, imageList[i-1].CreationTimestamp)
-			if len(imageList)-1 == i {
-				log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is singleton\"", singleton.Name, singleton.CreationTimestamp)
-			}
+			nonSingletons = append(nonSingletons, imageList[i])
+			log.Printf("utils.go: image eligible for deletion: name=%s creationTimestamp=%s reason=\"image is not a singleton\"", imageList[i].Name, imageList[i].CreationTimestamp)
+		}
+	}
+	for k, v := range nonSingletonsMap {
+		if v == "yes" {
+			log.Printf("Image of naming scheme %s is a singleton", k)
 		}
 	}
 	return nonSingletons
@@ -136,37 +119,20 @@ func GetOldAndNonSingletonInstances(computeService *compute.Service, project str
 }
 
 func getNonSingletonInstances(instanceList []*compute.Instance, nameDelimiter string) []*compute.Instance {
-	singleton := &compute.Instance{}
+	nonSingletonsMap := make(map[string]string)
 	nonSingletons := []*compute.Instance{}
 	for i := range instanceList {
-		if i == 0 {
-			singleton = instanceList[i]
-			continue
-		}
-
-		// Whether or not an instance is singleton is tracked using the singleton
-		// variable. If the two currently compared instances match, neither can be
-		// a singleton. If the two currently compared instances don't match and the
-		// singleton variable is set, the instance is a singleton. Otherwise, the
-		// instance that is the current `i` value in the loop is a candidate to be a
-		// singleton.
-		if resourceNamesMatch(instanceList[i-1].Name, instanceList[i].Name, nameDelimiter) {
-			singleton = &compute.Instance{}
-			nonSingletons = append(nonSingletons, instanceList[i-1])
-			if len(instanceList)-1 == i {
-				log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is most recent of its type\"", instanceList[i].Name, instanceList[i].CreationTimestamp)
-			}
-		} else if singleton.Name != "" {
-			singleton = instanceList[i]
-			log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is singleton\"", singleton.Name, singleton.CreationTimestamp)
+		if _, ok := nonSingletonsMap[getResourceName(instanceList[i].Name, nameDelimiter)]; !ok {
+			nonSingletonsMap[getResourceName(instanceList[i].Name, nameDelimiter)] = "yes"
+			log.Printf("utils.go: instance excluded from deletion: name=%s creationTimestamp=%s reason=\"instance is newest of its kind\"", instanceList[i].Name, instanceList[i].CreationTimestamp)
 		} else {
-			// Ignore the resource (instanceList[i-1]) that was matched to a resource at some point
-			// This block is run when the most recent of a certain type is at instanceList[i-1]
-			singleton = instanceList[i]
-			log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is most recent of its type\"", instanceList[i-1].Name, instanceList[i-1].CreationTimestamp)
-			if len(instanceList)-1 == i {
-				log.Printf("utils.go: excluded instance from deletion: name=%s creationTimestamp=%s reason=\"instance is singleton\"", singleton.Name, singleton.CreationTimestamp)
-			}
+			nonSingletons = append(nonSingletons, instanceList[i])
+			log.Printf("utils.go: instance eligible for deletion: name=%s creationTimestamp=%s reason=\"instance is not a singleton\"", instanceList[i].Name, instanceList[i].CreationTimestamp)
+		}
+	}
+	for k, v := range nonSingletonsMap {
+		if v == "yes" {
+			log.Printf("Instance of naming scheme %s is a singleton", k)
 		}
 	}
 	return nonSingletons
@@ -202,11 +168,8 @@ func parseCreationTimestamp(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339, s)
 }
 
-func resourceNamesMatch(a string, b string, delimiter string) bool {
-	aSplit := strings.Split(a, "-")
-	aName := strings.Join(aSplit[:len(aSplit)-1], "-")
-	bSplit := strings.Split(b, "-")
-	bName := strings.Join(bSplit[:len(bSplit)-1], "-")
-
-	return (aName == bName)
+func getResourceName(a string, delimiter string) string {
+	aSplit := strings.Split(a, delimiter)
+	return strings.Join(aSplit[:len(aSplit)-1], delimiter)
 }
+
