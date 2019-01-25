@@ -18,19 +18,22 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"sync"
-	"time"
 
-	"github.com/GoogleCloudPlatform/professional-services/tools/resource-janitor/pkg/delete"
-	"github.com/GoogleCloudPlatform/professional-services/tools/resource-janitor/pkg/utils"
+	"github.com/GoogleCloudPlatform/professional-services/tools/janitor/pkg/delete"
+	"github.com/GoogleCloudPlatform/professional-services/tools/janitor/pkg/images"
+	"github.com/GoogleCloudPlatform/professional-services/tools/janitor/pkg/instances"
+	"github.com/GoogleCloudPlatform/professional-services/tools/janitor/pkg/utils"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
 	yaml "gopkg.in/yaml.v2"
 )
 
+// BlacklistConfig stores a list of resources that should be ignored during
+// deletion.
 type BlacklistConfig struct {
 	Instances []string `yaml:"instances"`
 	Images    []string `yaml:"images"`
@@ -43,7 +46,9 @@ func main() {
 	olderThan := flag.Int64("older-than", 2592000, "Time in seconds that resources should not be older than")
 	logFile := flag.String("log-file", "", "File to which output is sent. Default is STDOUT.")
 	blacklistFile := flag.String("blacklist-file", "", "YAML config file with a list of naming schemes to ignore")
+	verbosity := flag.String("verbosity", "info", "YAML config file with a list of naming schemes to ignore")
 	deleteSingletons := flag.Bool("delete-singletons", false, "If set, all resources that are older than the time specified will be deleted regardless of whether they are the only resource of a certain name.")
+	logType := flag.String("log-type", "text", "If set, all resources that are older than the time specified will be deleted regardless of whether they are the only resource of a certain name.")
 	notDryRun := flag.Bool("not-dry-run", false, "Logs the changes that will be made without taking any actions.")
 
 	flag.Parse()
@@ -53,23 +58,42 @@ func main() {
 		if err != nil {
 			fmt.Printf("main.go: unable to open log file: %s", err)
 		}
-
 		log.SetOutput(file)
+	}
+
+	switch *verbosity {
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	case "warn":
+		log.SetLevel(log.WarnLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	case "fatal":
+		log.SetLevel(log.FatalLevel)
+	case "panic":
+		log.SetLevel(log.PanicLevel)
+	default:
+		log.SetLevel(log.InfoLevel)
+	}
+
+	if *logType == "json" {
+		log.SetFormatter(&log.JSONFormatter{})
 	}
 
 	blacklistConfig := BlacklistConfig{
 		Instances: []string{},
 		Images:    []string{},
 	}
+
 	if *blacklistFile != "" {
 		blacklist, err := ioutil.ReadFile(*blacklistFile)
 		if err != nil {
-			fmt.Printf("main.go: unable to open blacklist file: %s", err)
+			log.Infof("main.go: unable to open blacklist file: %s", err)
 		}
 
 		err = yaml.Unmarshal(blacklist, &blacklistConfig)
 		if err != nil {
-			fmt.Printf("main.go: unable to parse blacklist file: %s", err)
+			log.Infof("main.go: unable to parse blacklist file: %s", err)
 		}
 	}
 
@@ -80,10 +104,13 @@ func main() {
 
 	tooOld := utils.GetTooOldTime(*olderThan)
 
+	imtd := images.NewJanitorMetadata(compute, *project, tooOld, *deleteSingletons, blacklistConfig.Images, *nameDelimiter)
+	intd := instances.NewJanitorMetadata(compute, *project, tooOld, *deleteSingletons, blacklistConfig.Instances, *nameDelimiter)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go deleteImages(compute, *project, tooOld, *nameDelimiter, *workers, *notDryRun, *deleteSingletons, blacklistConfig.Images, &wg)
-	go deleteInstances(compute, *project, tooOld, *nameDelimiter, *workers, *notDryRun, *deleteSingletons, blacklistConfig.Instances, &wg)
+	go deleteImages(imtd, *workers, *notDryRun, &wg)
+	go deleteInstances(intd, *workers, *notDryRun, &wg)
 	wg.Wait()
 }
 
@@ -102,49 +129,50 @@ func initClient() (*compute.Service, error) {
 	return computeService, nil
 }
 
-func deleteImages(computeSvc *compute.Service, project string, tooOld time.Time, nameDelimiter string, workers int, notDryRun bool, deleteSingletons bool, blacklist []string, wg *sync.WaitGroup) {
-	images, err := utils.GetOldAndNonSingletonImages(computeSvc, project, tooOld, deleteSingletons, blacklist, nameDelimiter)
-	if err != nil {
-		log.Fatalf("main.go: unable to get list of images older than %s: %s", tooOld, err)
-	}
+func deleteImages(i *images.JanitorMetadata, workers int, notDryRun bool, wg *sync.WaitGroup) {
+	err := i.Refresh()
+	i.Blacklist()
+	i.Singletons()
+	i.Expired()
 
-	if len(images) == 0 {
-		log.Printf("main.go: no images to delete")
+	if len(i.Items) == 0 {
+		log.Info("No images to delete")
+		wg.Done()
+		return
 	}
 
 	if notDryRun {
-		log.Printf("main.go: issuing parallel image delete.")
-
-		err = delete.ParallelImages(computeSvc, project, workers, images)
+		err = delete.Parallel(workers, i)
 		if err != nil {
-			log.Fatalf("main.go: deletion exited with an error: %s", err)
+			log.Fatalf("Deletion exited with an error: %s", err)
 		}
 
-		log.Printf("main.go: successfully deleted old images")
+		log.Info("Successfully cleaned up images")
 	}
 
 	wg.Done()
 }
 
-func deleteInstances(computeSvc *compute.Service, project string, tooOld time.Time, nameDelimiter string, workers int, notDryRun bool, deleteSingletons bool, blacklist []string, wg *sync.WaitGroup) {
-	instances, err := utils.GetOldAndNonSingletonInstances(computeSvc, project, tooOld, deleteSingletons, blacklist, nameDelimiter)
-	if err != nil {
-		log.Fatalf("main.go: unable to get list of instances older than %s: %s", tooOld, err)
-	}
+func deleteInstances(i *instances.JanitorMetadata, workers int, notDryRun bool, wg *sync.WaitGroup) {
+	err := i.Refresh()
+	i.Blacklist()
+	i.Singletons()
+	i.Expired()
 
-	if len(instances) == 0 {
-		log.Printf("main.go: no instances to delete")
+	if len(i.Items) == 0 {
+		log.Info("No instances to delete")
+		wg.Done()
+		return
 	}
 
 	if notDryRun {
-		log.Printf("main.go: issuing parallel instances delete.")
-		err = delete.ParallelInstances(computeSvc, project, workers, instances)
+		err = delete.Parallel(workers, i)
 		if err != nil {
-			log.Fatalf("main.go: deletion exited with an error: %s", err)
+			log.Fatalf("Deletion exited with an error: %s", err)
 		}
-		log.Printf("main.go: successfully deleted old instances")
+
+		log.Info("Successfully cleaned up instances")
 	}
 
 	wg.Done()
 }
-

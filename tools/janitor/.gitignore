@@ -1,0 +1,4 @@
+.vscode/
+
+# Ignore binary created by go build
+janitor
